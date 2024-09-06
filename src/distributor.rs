@@ -166,7 +166,8 @@ mod tests {
         let distributor = LogDistributor::new(
             dir.path().to_owned(),
             RotationPolicy {
-                max_records: NonZeroUsize::new(2).unwrap(),
+                max_records: Some(NonZeroUsize::new(2).unwrap()),
+                time: None,
                 max_epochs: 2,
             },
         );

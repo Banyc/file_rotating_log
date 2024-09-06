@@ -6,22 +6,29 @@ use std::{
     time::Duration,
 };
 
-use crate::{table::Table, LogWriter};
+use crate::{cron::Cron, table::Table, LogWriter};
 
-pub fn spawn_flusher<W>(rotator: Arc<Mutex<LogRotator<W>>>, flush_interval: Duration)
+pub fn spawn_flushers<W>(rotators: Vec<Arc<Mutex<LogRotator<W>>>>, flush_interval: Duration)
 where
     W: LogWriter + Sync + Send + 'static,
 {
     std::thread::Builder::new()
         .name("LogRotator::flush()".to_string())
         .spawn({
-            let rotator = Arc::downgrade(&rotator);
+            let mut rotators = rotators.iter().map(Arc::downgrade).collect::<Vec<_>>();
             move || loop {
                 std::thread::sleep(flush_interval);
-                let Some(rotator) = rotator.upgrade() else {
-                    return;
-                };
-                rotator.lock().unwrap().flush();
+                let mut i = 0;
+                while let Some(rotator) = rotators.get(i) {
+                    let Some(rotator) = rotator.upgrade() else {
+                        rotators.swap_remove(i);
+                        continue;
+                    };
+                    i += 1;
+                    let mut rotator = rotator.lock().unwrap();
+                    rotator.flush();
+                    rotator.try_rotate_file();
+                }
             }
         })
         .expect("Failed to spawn the flushing worker thread");
@@ -38,7 +45,9 @@ where
     W: LogWriter,
 {
     pub fn new(output_dir: PathBuf, rotation: RotationPolicy) -> Self {
-        let epoch = cur_epoch(&output_dir).map(|e| e + 1).unwrap_or_default();
+        let epoch = cur_epoch(&output_dir)
+            .map(|e| e.wrapping_add(1))
+            .unwrap_or_default();
         let path = log_file_path(&output_dir, epoch, W::file_extension());
         let writer = create_clean_log_writer(path);
         let table = Table::new(writer, epoch);
@@ -49,7 +58,7 @@ where
             rotation,
         };
 
-        this.rotate_file();
+        this.enforce_epoch();
 
         this
     }
@@ -65,21 +74,38 @@ where
     pub fn incr_record_count(&mut self) {
         self.table.incr_record_count();
 
-        // Rotate log file
-        if self.rotation.max_records.get() <= self.table.records_written() {
-            let new_path = log_file_path(
-                &self.output_dir,
-                self.table.epoch() + 1,
-                W::file_extension(),
-            );
-            let new_writer = create_clean_log_writer(new_path);
-            self.table.replace(new_writer);
-
-            self.rotate_file();
-        }
+        self.try_rotate_file();
     }
 
-    fn rotate_file(&mut self) {
+    pub fn try_rotate_file(&mut self) {
+        let is_max_records_triggered = match self.rotation.max_records {
+            Some(max_records) => max_records.get() <= self.table.records_written(),
+            None => false,
+        };
+        let is_time_triggered = match &mut self.rotation.time {
+            Some(cron) => cron.edge_triggered_poll(jiff::Zoned::now()),
+            None => false,
+        };
+        let should_rotate = is_max_records_triggered || is_time_triggered;
+        if !should_rotate {
+            return;
+        }
+
+        self.replace_writer();
+        self.enforce_epoch();
+    }
+
+    fn replace_writer(&mut self) {
+        let new_path = log_file_path(
+            &self.output_dir,
+            self.table.epoch().wrapping_add(1),
+            W::file_extension(),
+        );
+        let new_writer = create_clean_log_writer(new_path);
+        self.table.replace(new_writer);
+    }
+
+    fn enforce_epoch(&mut self) {
         let epoch = self.table.epoch();
         write_epoch(&self.output_dir, epoch);
         delete_old_log_file(
@@ -93,7 +119,8 @@ where
 
 #[derive(Debug, Clone)]
 pub struct RotationPolicy {
-    pub max_records: NonZeroUsize,
+    pub max_records: Option<NonZeroUsize>,
+    pub time: Option<Cron>,
     pub max_epochs: usize,
 }
 
@@ -103,12 +130,10 @@ fn delete_old_log_file(
     output_dir: impl AsRef<Path>,
     extension: &str,
 ) {
-    let del_epoch = epoch.checked_sub(max_epochs);
-    if let Some(del_epoch) = del_epoch {
-        let del_path = log_file_path(output_dir, del_epoch, extension);
-        if del_path.exists() {
-            std::fs::remove_file(del_path).expect("Failed to remove outdated log file");
-        }
+    let del_epoch = epoch.wrapping_sub(max_epochs);
+    let del_path = log_file_path(output_dir, del_epoch, extension);
+    if del_path.exists() {
+        std::fs::remove_file(del_path).expect("Failed to remove outdated log file");
     }
 }
 
@@ -239,7 +264,8 @@ mod tests {
         let log_rotator = LogRotator::new(
             dir.path().to_owned(),
             RotationPolicy {
-                max_records: NonZeroUsize::new(2).unwrap(),
+                max_records: Some(NonZeroUsize::new(2).unwrap()),
+                time: None,
                 max_epochs: 2,
             },
         );
@@ -267,7 +293,8 @@ b,1
         let rotator = LogRotator::new(
             dir.path().to_owned(),
             RotationPolicy {
-                max_records: NonZeroUsize::new(2).unwrap(),
+                max_records: Some(NonZeroUsize::new(2).unwrap()),
+                time: None,
                 max_epochs: 2,
             },
         );

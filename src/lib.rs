@@ -1,5 +1,6 @@
 use std::path::Path;
 
+mod cron;
 pub mod distributor;
 pub mod rotator;
 mod table;
