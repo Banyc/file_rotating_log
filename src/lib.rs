@@ -4,7 +4,7 @@ mod cron;
 pub mod distributor;
 pub mod rotator;
 mod table;
-mod time_past;
+pub mod time_past;
 
 pub trait LogWriter: Sized {
     fn flush(&mut self);
