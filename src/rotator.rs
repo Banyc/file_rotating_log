@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{cron::Cron, table::Table, LogWriter};
+use crate::{table::Table, time_past::TimePast, LogWriter};
 
 pub fn spawn_flushers<W>(rotators: Vec<Arc<Mutex<LogRotator<W>>>>, flush_interval: Duration)
 where
@@ -83,7 +83,7 @@ where
             None => false,
         };
         let is_time_triggered = match &mut self.rotation.time {
-            Some(cron) => cron.edge_triggered_poll(jiff::Zoned::now()),
+            Some(time_past) => time_past.poll(jiff::Zoned::now()),
             None => false,
         };
         let should_rotate = is_max_records_triggered || is_time_triggered;
@@ -120,7 +120,7 @@ where
 #[derive(Debug, Clone)]
 pub struct RotationPolicy {
     pub max_records: Option<NonZeroUsize>,
-    pub time: Option<Cron>,
+    pub time: Option<TimePast>,
     pub max_epochs: usize,
 }
 
